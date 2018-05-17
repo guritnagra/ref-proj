@@ -1,0 +1,1778 @@
+package sailpoint.plugin.columndirectory.rest;
+
+import java.io.InputStream;
+import java.sql.Blob;
+import java.sql.Connection;
+import java.sql.PreparedStatement;
+import java.sql.ResultSet;
+import java.sql.SQLException;
+import java.util.ArrayList;
+import java.util.Collection;
+import java.util.HashMap;
+import java.util.Iterator;
+import java.util.List;
+import java.util.Map;
+
+import javax.ws.rs.Consumes;
+import javax.ws.rs.GET;
+import javax.ws.rs.HeaderParam;
+import javax.ws.rs.POST;
+import javax.ws.rs.Path;
+import javax.ws.rs.PathParam;
+import javax.ws.rs.Produces;
+import javax.ws.rs.QueryParam;
+import javax.ws.rs.core.MediaType;
+import javax.ws.rs.core.Response;
+import javax.ws.rs.core.Response.ResponseBuilder;
+
+import org.apache.commons.codec.binary.Base64;
+import org.apache.commons.logging.Log;
+import org.apache.commons.logging.LogFactory;
+import org.glassfish.jersey.media.multipart.BodyPartEntity;
+import org.glassfish.jersey.media.multipart.FormDataBodyPart;
+import org.glassfish.jersey.media.multipart.FormDataMultiPart;
+import org.glassfish.jersey.media.multipart.FormDataParam;
+import org.json.JSONArray;
+import org.json.JSONException;
+import org.json.JSONObject;
+
+import sailpoint.api.SailPointContext;
+import sailpoint.api.SailPointFactory;
+import sailpoint.object.AttributeMetaData;
+import sailpoint.object.Bundle;
+import sailpoint.object.EntitlementCollection;
+import sailpoint.object.EntitlementSnapshot;
+import sailpoint.object.Filter;
+import sailpoint.object.Identity;
+import sailpoint.object.IdentityEntitlement;
+import sailpoint.object.Link;
+import sailpoint.object.ManagedAttribute;
+import sailpoint.object.ObjectAttribute;
+import sailpoint.object.ObjectConfig;
+import sailpoint.object.Plugin;
+import sailpoint.object.QueryOptions;
+import sailpoint.object.QueryOptions.Ordering;
+import sailpoint.object.RoleDetection;
+import sailpoint.object.ScoreBandConfig;
+import sailpoint.object.ScoreConfig;
+import sailpoint.object.Scorecard;
+import sailpoint.plugin.Setting;
+import sailpoint.plugin.columndirectory.ColumnIdentityAttribute;
+import sailpoint.plugin.columndirectory.ColumnIdentityDTO;
+import sailpoint.plugin.columndirectory.ColumnIdentityEntitlement;
+import sailpoint.plugin.columndirectory.ColumnIdentityScorecard;
+import sailpoint.rest.plugin.BasePluginResource;
+import sailpoint.rest.plugin.RequiredRight;
+import sailpoint.server.Environment;
+import sailpoint.tools.GeneralException;
+
+@RequiredRight(value = "ColumnDirPluginRestServiceRight")
+@Path("/columndirectory")
+public class IdentityResource extends BasePluginResource {
+
+	public IdentityResource() {
+		// log.info("Entered.............");
+	}
+
+	/**
+	 * The logger
+	 */
+	private static final Log log = LogFactory.getLog(IdentityResource.class);
+	private static final int NO_CHILDREN = 0;
+	private static final int ALL_CHILDREN = 1;
+	private static final int FIRST_LEVEL = 2;
+	private SailPointContext context;
+
+	/**
+	 * Retrieves identity data
+	 * 
+	 * @param identityId
+	 *            the identity ID for the identity you want to retrieve cube
+	 *            data for.
+	 * @return String representing the identity JSON object
+	 * @throws Exception
+	 */
+
+	private Filter getIdentitySearchFilter(String searchFilter, String operator) {
+		Filter filter = null;
+		List<Filter> filters = new ArrayList<>();
+		String operation = null;
+		String cOperator = null;
+		String regex = "";
+
+		log.debug("Search value: " + searchFilter);
+
+		if (searchFilter != null && !"".equals(searchFilter)) {
+
+			if (searchFilter.contains("&&")) {
+				cOperator = "&&";
+				regex = "&&";
+			} else if (searchFilter.contains("||")) {
+				cOperator = "||";
+				regex = "\\|\\|";
+			}
+
+			if (cOperator != null) {
+
+				String[] split = searchFilter.split(regex);
+
+				// List<Filter> cFilters = new ArrayList<>();
+
+				log.debug("searchFilter" + searchFilter + " | Operator: " + cOperator + " | split: " + split);
+
+				log.debug("split2: " + searchFilter.split("||"));
+
+				for (String val : split) {
+					Filter cFilter = getIdentitySearchFilter(val, cOperator);
+
+					if (cFilter != null) {
+						filters.add(cFilter);
+					}
+				}
+
+			} else {
+				if (searchFilter.contains("!=")) {
+					operation = "!=";
+				} else {
+					operation = "==";
+				}
+
+				String[] split2 = searchFilter.split(operation);
+
+				if (split2.length == 2) {
+					String attr = split2[0].trim();
+					String value = split2[1].trim();
+
+					log.debug("Filter: " + attr + " | " + value + " | " + operation);
+
+					Filter filter1 = Filter.like(attr, value, Filter.MatchMode.EXACT);
+
+					switch (operation) {
+					case "==":
+						// filter = Filter.eq(attr, value);
+						break;
+					case "!=":
+						filter1 = Filter.not(filter1);
+						break;
+					}
+
+					filters.add(filter1);
+				}
+			}
+		}
+
+		if (cOperator == null) {
+
+			// if it is an or operator
+			if ("||".equals(operator)) {
+				filter = Filter.or(filters);
+			} else {
+				filter = Filter.and(filters);
+			}
+		} else {
+			if (cOperator.contains("||")) {
+				filter = Filter.or(filters);
+			} else {
+				filter = Filter.and(filters);
+			}
+		}
+
+		return filter;
+	}
+
+	private Filter getIdentitySearchFilter(String searchFilter) {
+		return this.getIdentitySearchFilter(searchFilter, "&&");
+	}
+
+	private Filter getIdentitySearchFilterOld(String searchFilter) {
+		Filter filter = null;
+		List<Filter> filters = new ArrayList<>();
+		String operation = null;
+		String[] split = searchFilter.split(";");
+
+		for (String val : split) {
+			log.debug("Split value: " + val);
+
+			if (val != null && !"".equals(val)) {
+
+				if (val.contains("==")) {
+					operation = "==";
+				} else if (val.contains("!=")) {
+					operation = "!=";
+				}
+
+				String[] split2 = val.split(operation);
+
+				if (split2.length == 2) {
+					String attr = split2[0].trim();
+					String value = split2[1].trim();
+
+					log.debug("Filter: " + attr + " | " + value + " | " + operation);
+
+					Filter filter1 = Filter.like(attr, value, Filter.MatchMode.EXACT);
+
+					switch (operation) {
+					case "==":
+						// filter = Filter.eq(attr, value);
+						break;
+					case "!=":
+						filter1 = Filter.not(filter1);
+						break;
+					}
+
+					filters.add(filter1);
+				}
+			}
+		}
+
+		filter = Filter.and(filters);
+
+		return filter;
+	}
+
+	/**
+	 * Retrieves a list of all identities
+	 * 
+	 *
+	 * @return response containing the identity data
+	 * @throws Exception
+	 */
+	@SuppressWarnings("deprecation")
+	@RequiredRight(value = "ColumnDirPluginRestServiceRight")
+	@GET
+	@Path("/getAllIdentities")
+	@Produces(MediaType.APPLICATION_JSON)
+	public Response getAllIdentities(@HeaderParam("filter") String sFilter) throws Exception {
+		SailPointContext context = SailPointFactory.getCurrentContext();
+		ResponseBuilder response = null;
+		JSONArray ja = new JSONArray();
+		QueryOptions qo = new QueryOptions();
+		JSONObject filter = new JSONObject(sFilter);
+		JSONObject anySearch = filter.getJSONObject("search");
+		List<Ordering> orderings = new ArrayList<Ordering>();
+		Ordering o = new Ordering("displayName", true);
+		orderings.add(o);
+		qo.setOrderings(orderings);
+		qo.addFilter(Filter.not(Filter.like("name", "spadmin", Filter.MatchMode.ANYWHERE)));
+		if ((anySearch.getString("anySearch").length() > 2)) {
+
+			String searchtext = anySearch.getString("anySearch");
+			qo.addFilter(Filter.like("displayName", searchtext, Filter.MatchMode.ANYWHERE));
+
+		}
+		if (anySearch.getString("searchFirstName").length() > 0) {
+			String searchFN = anySearch.getString("searchFirstName");
+			qo.addFilter(Filter.like("firstname", searchFN, Filter.MatchMode.ANYWHERE));
+		}
+		if (anySearch.getString("searchLastName").length() > 0) {
+			String searchLN = anySearch.getString("searchLastName");
+			qo.addFilter(Filter.like("lastname", searchLN, Filter.MatchMode.ANYWHERE));
+		}
+		if (anySearch.getString("searchEmail").length() > 0) {
+			String searchEM = anySearch.getString("searchEmail");
+			qo.addFilter(Filter.like("email", searchEM, Filter.MatchMode.ANYWHERE));
+		}
+		if (anySearch.getString("searchManager").length() > 0) {
+
+			String searchMGR = anySearch.getString("searchManager");
+			if (searchMGR.contains(" ")) {
+
+				QueryOptions qor = new QueryOptions();
+				qor.addFilter(Filter.like("displayName", searchMGR, Filter.MatchMode.ANYWHERE));
+				List<Identity> mgrid = context.getObjects(Identity.class, qor);
+
+				for (Identity id : mgrid) {
+					qo.addFilter(Filter.like("manager.name", id.getName(), Filter.MatchMode.ANYWHERE));
+
+				}
+				System.out.println(qo);
+			} else {
+				qo.addFilter(Filter.like("manager.name", searchMGR, Filter.MatchMode.ANYWHERE));
+
+			}
+		}
+
+		int pageNumber = filter.getInt("pageNumber") - 1;
+		qo.setResultLimit(filter.getInt("pageSize"));
+		qo.setFirstRow(pageNumber * filter.getInt("pageSize"));
+		int count = context.countObjects(Identity.class, qo);
+		// retrieves all the identities to return
+
+		List<Identity> ids = context.getObjects(Identity.class, qo);
+		for (Identity id : ids) {
+
+			JSONObject jo = this.convertToIdentityDTO(id, NO_CHILDREN);
+
+			if (id.getManager() != null) {
+				if (id.getManager().getName() != null) {
+					jo.append("mgr", id.getManager().getName());
+				} else {
+					jo.append("mgr", " ");
+				}
+			} else {
+				jo.append("mgr", " ");
+			}
+			JSONArray jaLink = new JSONArray();
+			if (id.getLinks() != null) {
+				List<Link> appAcc = id.getLinks();
+
+				for (Link link : appAcc) {
+
+					System.out.println(link.getNativeIdentity());
+					JSONObject joLink = new JSONObject();
+
+					joLink.put("Application", link.getApplicationName());
+					joLink.put("nativeIdentity", link.getNativeIdentity());
+					joLink.put("AccountName", link.getDisplayableName());
+
+					if (link.getAttribute("IIQDisabled") == null) {
+						joLink.put("Status", "Active");
+						joLink.put("color", "green");
+
+					} else {
+						joLink.put("Status", "Inactive");
+						joLink.put("color", "red");
+
+					}
+					jaLink.put(joLink);
+
+				}
+			}
+			if (jo.get("inactive") != null) {
+
+				if (jo.get("inactive").toString() == "true") {
+					jo.append("color", "red");
+				} else {
+					jo.append("color", "green");
+				}
+			} else {
+				jo.append("color", "red");
+			}
+
+			jo.append("link", jaLink);
+			JSONArray jaAssigned = new JSONArray();
+			if (id.getBundles() != null) {
+				List<Bundle> roles = id.getBundles();
+
+				//// System.out.println("LINK8===>");
+				for (Bundle bndl : roles) {
+					//// System.out.println("LINK9===>");
+					JSONObject joAssigned = new JSONObject();
+					joAssigned.put("name", bndl.getName());
+					joAssigned.put("description", bndl.getDescription("en_US"));
+					joAssigned.put("type", bndl.getType());
+					jaAssigned.put(joAssigned);
+				}
+			}
+			if (id.getAssignedRoles() != null) {
+				List<Bundle> assignedRoles = id.getAssignedRoles();
+				for (Bundle assignBndl : assignedRoles) {
+
+					JSONObject joAssign = new JSONObject();
+					joAssign.put("name", assignBndl.getName());
+					jaAssigned.put(joAssign);
+				}
+			}
+			jo.append("assignRole", jaAssigned);
+			JSONArray jaEnt = new JSONArray();
+
+			Filter filters = Filter.eq("identity.name", id.getName());
+			QueryOptions qou = new QueryOptions();
+			qou.addFilter(filters);
+
+			List<IdentityEntitlement> entitlements = context.getObjects(IdentityEntitlement.class, qou);
+			for (IdentityEntitlement e : entitlements) {
+
+				QueryOptions qort = new QueryOptions();
+				if (e.getNativeIdentity() != null && e.getAppName() != null) {
+					qort.add(Filter.eq("ManagedAttribute.value", e.getValue()));
+					qort.add(Filter.like("ManagedAttribute.attribute", e.getName()));
+					qort.add(Filter.like("ManagedAttribute.application.name", e.getAppName()));
+					List<ManagedAttribute> entit = context.getObjects(ManagedAttribute.class, qort);
+					for (ManagedAttribute ma : entit) {
+
+						if (ma.getApplication() != null && ma.getValue() != null && ma.getAttribute() != null) {
+							JSONObject joEnt = new JSONObject();
+							joEnt.put("app", ma.getApplication().getName());
+							joEnt.put("name", ma.getDisplayableName());
+							joEnt.put("description", ma.getAttribute("sysDescriptions"));
+							jaEnt.put(joEnt);
+						}
+					}
+				}
+			}
+
+			jo.append("Ent", jaEnt);
+
+			ja.put(jo);
+
+			System.out.println("******************");
+		}
+
+		JSONObject jo = new JSONObject();
+		jo.put("data", ja);
+		jo.put("totalrowcount", count);
+		response = Response.ok(jo.toString());
+
+		return response.build();
+	}
+
+	/**
+	 * Retrieves a list of identities based on the filter parameter header
+	 * 
+	 * @param sFilter
+	 *            the header parameter JSON data in a string format.
+	 * @return response containing the identity data
+	 * @throws Exception
+	 */
+	@RequiredRight(value = "ColumnDirPluginRestServiceRight")
+	@GET
+	@Path("/getIdentities")
+	@Produces(MediaType.APPLICATION_JSON)
+	public Response getIdentities(@HeaderParam("filter") String sFilter) throws Exception {
+		SailPointContext context = SailPointFactory.getCurrentContext();
+		ResponseBuilder response = null;
+		JSONArray ja = new JSONArray();
+		QueryOptions qo = new QueryOptions();
+		int count = 0;
+
+		Map<Object, Object> settings = this.getPluginSettings();
+
+		// checks the settings to see if all inactive identities need to be
+		// filtered out.
+		if (settings.containsKey("showInactives")) {
+			// boolean showInactives = (boolean) settings.get("showInactives");
+
+			if (settings.get("showInactives").equals("false")) {
+				log.debug("filter inactive");
+				qo.addFilter(Filter.eq("inactive", false));
+			}
+		}
+
+		if (settings.containsKey("identitySearchFilter") && !"".equals(settings.get("identitySearchFilter"))) {
+			log.debug("identitySearchFilter");
+			Filter filter = this.getIdentitySearchFilter((String) settings.get("identitySearchFilter"));
+
+			log.debug("filter" + filter);
+
+			if (filter != null) {
+				qo.addFilter(filter);
+			}
+		}
+
+		log.debug("filter: " + sFilter);
+
+		try {
+			// parses the JSON string into a JSON object to retrieve the data
+			JSONObject filter = new JSONObject(sFilter);
+
+			// gets the JSON object containing all the fields to filter the
+			// identities by
+			JSONObject fields = filter.getJSONObject("filterByFields");
+			Iterator<?> keys = fields.keys();
+
+			// iterates through the fields
+			while (keys.hasNext()) {
+				String field = (String) keys.next();
+
+				Object value = fields.get(field);
+
+				if (value != null) {
+					if (value instanceof String) {
+						if (!((String) value).isEmpty()) {
+							if (field.equals("manager")) {
+
+								List<Filter> mFilters = new ArrayList<Filter>();
+
+								// retrieves all the managers containing the
+								// value form the filter
+								Iterator<Identity> identIter = this.getAllManagers((String) value);
+
+								boolean foundManagers = false;
+
+								// loops through all the managers and adds the
+								// filters to the mFilters list
+								while (identIter.hasNext()) {
+									Identity manager = (Identity) identIter.next();
+
+									mFilters.add(Filter.eq("manager", manager));
+
+									foundManagers = true;
+								}
+
+								// if no managers were returned, return with an
+								// empty JSON array
+								if (!foundManagers) {
+									return Response.ok("[]").build();
+								}
+
+								qo.add(Filter.or(mFilters));
+
+							} else {
+								// if the field is not a manager, perform the
+								// search as a string value
+								qo.addFilter(Filter.like(field, value, Filter.MatchMode.ANYWHERE));
+							}
+						}
+					} else {
+						// if the field value is not a string, perform an equal
+						// search for the object (e.g. boolean)
+						qo.addFilter(Filter.eq(field, value));
+					}
+				} else {
+					log.debug("null search attribute value");
+				}
+			}
+
+			// retrieves a record count of all the identities that match the
+			// criteria
+			count = context.countObjects(Identity.class, qo);
+
+			JSONObject ordering = filter.getJSONObject("orderBy");
+			Iterator<?> oKeys = ordering.keys();
+			List<Ordering> orderings = new ArrayList<Ordering>();
+
+			// loops through and adds all the order by fields to the query.
+			while (oKeys.hasNext()) {
+				String orderField = (String) oKeys.next();
+
+				Object value = ordering.get(orderField);
+
+				if (value != null) {
+					if (value instanceof String) {
+						if (!((String) value).isEmpty()) {
+
+							boolean ascending = "asc".equals((String) value.toString());
+
+							Ordering o = new Ordering(orderField, ascending, true);
+
+							orderings.add(o);
+						}
+					}
+				}
+			}
+
+			qo.setOrderings(orderings);
+
+			// sets the criteria for what identities are to be returned based on
+			// page size and page number
+			if (filter.getInt("pageSize") > 0) {
+				int pageNumber = filter.getInt("pageNumber") - 1;
+
+				qo.setResultLimit(filter.getInt("pageSize"));
+				qo.setFirstRow(pageNumber * filter.getInt("pageSize"));
+			}
+
+		} catch (JSONException ex) {
+			log.debug(ex);
+			// do nothing
+		}
+
+		// retrieves all the identities to return
+		List<Identity> ids = context.getObjects(Identity.class, qo);
+
+		for (Identity id : ids) {
+
+			JSONObject jo = this.convertToIdentityDTO(id, NO_CHILDREN);
+
+			ja.put(jo);
+		}
+
+		JSONObject jo = new JSONObject();
+
+		jo.put("data", ja);
+		jo.put("totalrowcount", count);
+
+		response = Response.ok(jo.toString());
+
+		return response.build();
+	}
+
+	/**
+	 * Retrieves all managers that contain the search string in their name if
+	 * one is specified.
+	 * 
+	 * @param search
+	 *            the text to search the manager's names by
+	 * @return string representing the JSON array of all the managers
+	 * @throws Exception
+	 */
+	@GET
+	@Path("/getManagers")
+	@Produces(MediaType.APPLICATION_JSON)
+	public String getManagers(@HeaderParam("filter") String search) throws Exception {
+
+		JSONArray ja = new JSONArray();
+
+		// if search is null, set it to an empty string.
+		search = search == null ? "" : search;
+
+		log.debug("Manager search: " + search);
+
+		Iterator<Identity> identIter = this.getAllManagers(search);
+
+		while (identIter.hasNext()) {
+			Identity identity = (Identity) identIter.next();
+
+			JSONObject jo = this.convertToIdentityDTO(identity, NO_CHILDREN);
+
+			ja.put(jo);
+		}
+
+		log.debug("JSON Array: ");
+
+		log.debug(ja.toString());
+
+		return ja.toString();
+	}
+
+	/**
+	 * Performs a search for all managers containing the search text in their
+	 * names
+	 * 
+	 * @param searchText
+	 *            the text to search the manager's names by
+	 * @return an iterator to loop through the identities with.
+	 * @throws Exception
+	 */
+	private Iterator<Identity> getAllManagers(String searchText) throws Exception {
+		SailPointContext context = SailPointFactory.getCurrentContext();
+
+		Map<Object, Object> settings = this.getPluginSettings();
+
+		QueryOptions qo = new QueryOptions();
+
+		qo.addFilter(Filter.eq("managerStatus", true));
+		qo.addOrdering("displayName", true);
+		qo.setResultLimit(25);
+
+		if (settings.containsKey("identitySearchFilter") && !"".equals(settings.get("identitySearchFilter"))) {
+			log.debug("identitySearchFilter");
+			Filter filter = this.getIdentitySearchFilter((String) settings.get("identitySearchFilter"));
+
+			log.debug("filter" + filter);
+
+			if (filter != null) {
+				qo.addFilter(filter);
+			}
+		}
+
+		if (settings.containsKey("managerSearchFilter") && !"".equals(settings.get("managerSearchFilter"))) {
+			log.debug("managerSearchFilter");
+			Filter filter = this.getIdentitySearchFilter((String) settings.get("managerSearchFilter"));
+
+			log.debug("filter" + filter);
+
+			if (filter != null) {
+				qo.addFilter(filter);
+			}
+		}
+
+		if (!searchText.isEmpty()) {
+			qo.addFilter(Filter.like("displayName", searchText, Filter.MatchMode.ANYWHERE));
+		}
+
+		return context.search(Identity.class, qo);
+	}
+
+	/**
+	 * Retrieves the identity cube of the currently logged in user plus an
+	 * 'isPluginAdmin' field for determining whether or not the current user
+	 * should have administrator privileges
+	 * 
+	 * @return response containing the string representation of the identity
+	 *         JSON object
+	 * @throws Exception
+	 */
+	@GET
+	@Path("/getCurrentUser")
+	@Produces(MediaType.APPLICATION_JSON)
+	public Response getCurrentUser() throws Exception {
+
+		SailPointContext context = SailPointFactory.getCurrentContext();
+
+		Identity identity = context.getObjectByName(Identity.class, context.getUserName());
+
+		JSONObject jo = this.convertToIdentityDTO(identity, NO_CHILDREN);
+
+		// checks to see if the user is a plugin admin by checking if the user
+		// is a system admin or has
+		// the column directory admin capability
+		boolean admin = identity.getCapabilityManager().hasCapability("ColumnDirPluginAdminCapability") ? true
+				: identity.getCapabilityManager().hasCapability("SystemAdministrator");
+
+		jo.put("isPluginAdmin", admin);
+
+		/*
+		 * ObjectConfig sysConfig = context.getObjectByName(ObjectConfig.class,
+		 * "SystemConfiguration");
+		 * 
+		 * String serverRootPath = sysConfig.getString("serverRootPath");
+		 */
+
+		log.debug("CurrentUser: ");
+		log.debug(jo.toString());
+
+		return Response.ok(jo.toString()).build();
+	}
+
+	/**
+	 * REST service for retrieving all the plugin's current settings as set by
+	 * the settings configuration menu
+	 * 
+	 * @return a map of all the settings
+	 * @throws Exception
+	 */
+
+	@RequiredRight("ColumnDirPluginRight")
+	@GET
+	@Path("/getSettings")
+	@Produces(MediaType.APPLICATION_JSON)
+	public Map<Object, Object> getSettings() throws Exception {
+		return this.getPluginSettings();
+	}
+
+	/**
+	 * Retrieves all the plugin's current settings as set by the settings
+	 * configuration menu
+	 * 
+	 * @return a map of all the settings
+	 * @throws Exception
+	 */
+	private Map<Object, Object> getPluginSettings() throws Exception {
+		Map<Object, Object> settings = new HashMap<Object, Object>();
+		SailPointContext context = SailPointFactory.getCurrentContext();
+		List<ScoreConfig> scList = context.getObjects(ScoreConfig.class);
+		JSONArray sbObj = new JSONArray();
+		List<String> identityAttrFields = new ArrayList<String>();
+
+		identityAttrFields.add("hierarchyFields");
+		identityAttrFields.add("identityViewFields");
+		identityAttrFields.add("hierarchyHoverFields");
+
+		if (!scList.isEmpty()) {
+			ScoreConfig sc = scList.get(0);
+
+			List<ScoreBandConfig> sbcList = sc.getBands();
+
+			for (ScoreBandConfig sbc : sbcList) {
+				JSONObject obj = new JSONObject().put("lowerBound", sbc.getLowerBound())
+						.put("upperBound", sbc.getUpperBound()).put("color", sbc.getColor());
+
+				sbObj.put(obj);
+			}
+		}
+
+		settings.put("riskBands", sbObj.toString());
+
+		// Plugin plugin = PluginRegistry.get("ColumnDirectory");
+		Plugin plugin = context.getObject(Plugin.class, "columndirectory");
+		if (plugin != null) {
+			List<Setting> settingsAttrs = plugin.getSettings();
+			for (Setting setting : settingsAttrs) {
+
+				// if it's the hierarchyFields or identityViewFields setting,
+				// retrieve the attribute objects for the fields to return.
+				if (identityAttrFields.contains(setting.getName())) {
+
+					String value = setting.getValue() == null ? setting.getDefaultValue() : setting.getValue();
+
+					log.debug("Identity Attribute Field " + setting.getName() + " value: " + value);
+
+					String[] hf = value.split(",");
+
+					ObjectConfig idenConfig = context.getObjectByName(ObjectConfig.class, "Identity");
+
+					List<ColumnIdentityAttribute> attrFields = new ArrayList<ColumnIdentityAttribute>();
+
+					attrFields.add(this.getAttribute(idenConfig.getObjectAttribute("displayName")));
+
+					if (hf != null) {
+						for (String field : hf) {
+							ColumnIdentityAttribute colAttr = this.getAttribute(idenConfig.getObjectAttribute(field));
+							if (colAttr != null) {
+								attrFields.add(colAttr);
+							}
+						}
+					}
+
+					settings.put(setting.getName(), attrFields);
+
+				} else {
+					Object value = setting.getValue() == null || "".equals(setting.getValue())
+							? setting.getDefaultValue() : setting.getValue();
+
+					settings.put(setting.getName(), value);
+				}
+			}
+		}
+		return settings;
+	}
+
+	/**
+	 * Converts the object attribute into a ColumnIdentityAttribute
+	 * 
+	 * @param attr
+	 *            the identity object to convert
+	 * @return the ColumnIdentityAttribute representation of the attribute
+	 */
+	private ColumnIdentityAttribute getAttribute(ObjectAttribute attr) {
+		String type = "";
+
+		// gets the type of the attribute and determines what the ng-table
+		// column data type should be.
+		if (attr == null) {
+			return null;
+		}
+		if (attr.getType() != null) {
+			switch (attr.getType()) {
+			case ObjectAttribute.TYPE_STRING:
+				type = "text";
+				break;
+			case ObjectAttribute.TYPE_BOOLEAN:
+				type = "switch";
+				break;
+
+			case ObjectAttribute.TYPE_INT:
+			case ObjectAttribute.TYPE_LONG:
+				type = "number";
+				break;
+			default:
+
+				if (ObjectAttribute.TYPE_IDENTITY.equals(attr.getType())) {
+					type = "text";
+				}
+
+				// log.debug("attr " + attr.getName() + " type: " +
+				// attr.getType());
+			}
+		}
+		boolean searchable = attr.isStandard() ? true : attr.isExtended();
+
+		if (type.isEmpty()) {
+			searchable = false;
+		}
+
+		return new ColumnIdentityAttribute(attr.getName(), attr.getDisplayableName(getLocale()), type, searchable);
+	}
+
+	/**
+	 * Retrieves all the identity attributes that the identity object could send
+	 * over.
+	 * 
+	 * @return
+	 * @throws Exception
+	 */
+	@GET
+	@Path("/getAttributes")
+	@Produces(MediaType.APPLICATION_JSON)
+	public List<ColumnIdentityAttribute> getAttributes(@HeaderParam("filter") String sFilter) throws Exception {
+		SailPointContext context = SailPointFactory.getCurrentContext();
+		boolean standardOnly = false;
+
+		if (sFilter != null) {
+			try {
+				// parses the JSON string into a JSON object to retrieve the
+				// data
+				JSONObject filter = new JSONObject(sFilter);
+
+				standardOnly = filter.getBoolean("standardOnly");
+			} catch (Exception ex) {
+				log.debug(ex);
+			}
+		}
+
+		List<ColumnIdentityAttribute> attrs = new ArrayList<ColumnIdentityAttribute>();
+
+		ObjectConfig idenConfig = context.getObjectByName(ObjectConfig.class, "Identity");
+
+		for (ObjectAttribute attr : idenConfig.getStandardAttributes()) {
+			Map<Object, Object> settings = this.getPluginSettings();
+
+			// if the attribute is the inactive attribute and the showInactives
+			// plugin setting is false,
+			// do not add that attribute.
+			if (attr.getName().equals("inactive")) {
+				if (settings.containsKey("showInactives")) {
+					if (!settings.get("showInactives").equals("false")) {
+						attrs.add(this.getAttribute(attr));
+					}
+				}
+			} else {
+				attrs.add(this.getAttribute(attr));
+			}
+		}
+
+		// if only standard attributes are requested, do not retrieve custom
+		// attributes
+		if (!standardOnly) {
+			for (ObjectAttribute attr : idenConfig.getCustomAttributes()) {
+				attrs.add(this.getAttribute(attr));
+			}
+		}
+
+		return attrs;
+	}
+
+	/**
+	 * Retrieves a list of all the identity attribute's names
+	 * 
+	 * @return
+	 * @throws GeneralException
+	 */
+	private List<String> getAllAttributes() throws GeneralException {
+
+		SailPointContext ctx = getContext();
+
+		ObjectConfig idenConfig = ctx.getObjectByName(ObjectConfig.class, "Identity");
+
+		// log.debug("Got " + idenConfig.getObjectAttributes().size() + "
+		// available Identity attributes");
+
+		List<String> attrs = new ArrayList<String>();
+
+		for (ObjectAttribute attr : idenConfig.getStandardAttributes()) {
+			attrs.add(attr.getName());
+
+			// log.info("attribute: " + attr.getName() + " - " +
+			// attr.getDisplayName());
+			// System.out.println("attribute: " + attr.getName() + " - " +
+			// attr.getDisplayName());
+		}
+
+		for (ObjectAttribute attr : idenConfig.getCustomAttributes()) {
+			attrs.add(attr.getName());
+		}
+
+		return attrs;
+	}
+
+	/**
+	 * Adds all the identity's attributes to the JSONObject
+	 * 
+	 * @param jo
+	 *            the JSONObject to add the attributes to
+	 * @param id
+	 *            the Identity object to get the attributes from
+	 * @return the JSONOBject containing all the attributes
+	 */
+	private JSONObject addAttributes(JSONObject jo, Identity id) {
+
+		if (id.getAttributeMetaData() == null) {
+			return jo;
+		}
+
+		for (AttributeMetaData am : id.getAttributeMetaData()) {
+			try {
+				String attrName = am.getAttribute();
+				Object attrValue = "";
+
+				// if manager attribute, get the manager's display name.
+				if ("manager".equals(attrName)) {
+					attrValue = id.getManager().getDisplayName();
+				} else {
+					attrValue = id.getAttribute(attrName) == null ? "" : id.getAttribute(am.getAttribute());
+				}
+
+				jo.put(attrName, attrValue);
+			} catch (Exception ex) {
+				log.debug(ex);
+				// ex.printStackTrace();
+			}
+		}
+
+		return jo;
+	}
+
+	/**
+	 * Converts the identity to a JSONObject containing all the necessary fields
+	 * 
+	 * @param id
+	 *            the identity object to convert
+	 * @param levelOption
+	 *            Set how many children levels should be added to the identity.
+	 *            Either NO_CHILDREN, ALL_CHILDREN, or FIRST_LEVEL which
+	 *            retrieves the first level of identities below this identity.
+	 * @return JSONObject containing all the identity data
+	 * @throws Exception
+	 */
+	private JSONObject convertToIdentityDTO(Identity id, int levelOption) throws Exception {
+		SailPointContext context = SailPointFactory.getCurrentContext();
+
+		Map<Object, Object> settings = this.getPluginSettings();
+
+		ColumnIdentityDTO idDTO = new ColumnIdentityDTO(id.getId());
+		log.debug("identit ID ..." + id.getId());
+		String imageData = getImageDataHelper(id.getId());
+		idDTO.setImage(imageData);
+
+		if (id.getManager() != null) {
+			idDTO.setManagerId(id.getManager().getId());
+			// idDTO.setManagerName(id.getManager().getDisplayName());
+		}
+
+		idDTO.setEntitlements(this.getEntitlements(id));
+		idDTO.setAppAccounts(this.getAppAccounts(id));
+		idDTO.setRoles(this.getRoles(id));
+		idDTO.setScorecard(this.getScorecard(id));
+		idDTO.setManagerStatus(id.getManagerStatus());
+
+		JSONObject jo = new JSONObject(idDTO);
+
+		for (String attr : this.getAllAttributes()) {
+			jo.put(attr, "");
+		}
+
+		jo = this.addAttributes(jo, id);
+
+		// if there is no displayName set in the identity attributes,
+		// add the displayName value from the identity object
+		if (jo.get("displayName").toString().isEmpty()) {
+			jo.put("displayName", id.getDisplayName());
+		}
+
+		JSONArray ja = new JSONArray();
+
+		if (levelOption == ALL_CHILDREN || levelOption == FIRST_LEVEL) {
+			QueryOptions qo = new QueryOptions();
+
+			qo.addFilter(Filter.eq("manager", id));
+
+			// checks the settings to see if all inactive identities need to be
+			// filtered out.
+			if (settings.containsKey("showInactives")) {
+				// boolean showInactives = (boolean)
+				// settings.get("showInactives");
+
+				if (settings.get("showInactives").equals("false")) {
+					log.debug("filter inactive");
+					qo.addFilter(Filter.eq("inactive", false));
+				}
+			}
+
+			if (settings.containsKey("identitySearchFilter") && !"".equals(settings.get("identitySearchFilter"))) {
+				log.debug("identitySearchFilter");
+				Filter filter = this.getIdentitySearchFilter((String) settings.get("identitySearchFilter"));
+
+				log.debug("filter" + filter);
+
+				if (filter != null) {
+					qo.addFilter(filter);
+				}
+			}
+
+			if (settings.containsKey("managerSearchFilter") && !"".equals(settings.get("managerSearchFilter"))) {
+				log.debug("managerSearchFilter");
+				Filter filter = this.getIdentitySearchFilter((String) settings.get("managerSearchFilter"));
+
+				log.debug("filter" + filter);
+
+				if (filter != null) {
+					qo.addFilter(filter);
+				}
+			}
+
+			Iterator<Identity> identIter = context.search(Identity.class, qo);
+
+			while (identIter.hasNext()) {
+				Identity identity = (Identity) identIter.next();
+
+				JSONObject cjo = null;
+
+				int childOption = levelOption == ALL_CHILDREN ? ALL_CHILDREN : NO_CHILDREN;
+
+				cjo = this.convertToIdentityDTO(identity, childOption);
+
+				ja.put(cjo);
+			}
+		}
+
+		jo.put("children", ja);
+
+		return jo;
+	}
+
+	/**
+	 * Gets the identity scorecard for the identity
+	 * 
+	 * @param id
+	 *            the identity to get the scorecard for
+	 * @return the ColumnIdentityScorecard containing all the identity's risk
+	 *         scores
+	 */
+	private ColumnIdentityScorecard getScorecard(Identity id) {
+		ColumnIdentityScorecard sc = new ColumnIdentityScorecard();
+
+		Scorecard s = id.getScorecard();
+
+		if (s == null) {
+			return sc;
+		}
+
+		sc.setRoleScore(s.getBusinessRoleScore());
+		sc.setCertScore(s.getCertificationScore());
+		sc.setCompositeScore(s.getCompositeScore());
+		sc.setEntitlementScore(s.getEntitlementScore());
+		sc.setPolicyScore(s.getPolicyScore());
+
+		return sc;
+	}
+
+	/**
+	 * Retrieves a list of all the displayable names of the roles the identity
+	 * has
+	 * 
+	 * @param id
+	 *            the identity to get the roles for
+	 * @return
+	 */
+	private List<String> getRoles(Identity id) {
+		List<String> roles = new ArrayList<>();
+
+		if (id.getBundles() == null) {
+			return roles;
+		}
+
+		for (Bundle b : id.getBundles()) {
+			String role = b.getDisplayableName();
+
+			roles.add(role);
+		}
+
+		return roles;
+	}
+
+	/**
+	 * Retrieves a list of all the application names for the accounts the
+	 * identity has
+	 * 
+	 * @param id
+	 *            the identity to get the accounts for
+	 * @return
+	 */
+	private List<String> getAppAccounts(Identity id) {
+		List<String> accs = new ArrayList<>();
+
+		if (id.getLinks() == null) {
+			return accs;
+		}
+
+		for (Link l : id.getLinks()) {
+			if (!accs.contains(l.getApplicationName()))
+				accs.add(l.getApplicationName());
+		}
+
+		return accs;
+	}
+
+	/**
+	 * Retrieves a list of all the entitlements the identity has
+	 * 
+	 * @param id
+	 *            the identity to get the entitlements for
+	 * @return a list of all the entitlements
+	 */
+	private List<ColumnIdentityEntitlement> getEntitlements(Identity id) throws Exception {
+		List<ColumnIdentityEntitlement> ents = new ArrayList<>();
+
+		EntitlementCollection ec = id.convertLinks(true);
+
+		Collection<EntitlementSnapshot> esCol = ec.getEntitlements();
+
+		if (esCol == null) {
+			return ents;
+		}
+
+		Iterator<EntitlementSnapshot> it = esCol.iterator();
+
+		while (it.hasNext()) {
+			EntitlementSnapshot es = it.next();
+
+			if (es.getAttributeNames() != null) {
+				for (String n : es.getAttributeNames()) {
+
+					String esVal = es.getAttributes().get(n).toString();
+
+					ColumnIdentityEntitlement ent = new ColumnIdentityEntitlement(es.getApplicationName(), esVal);
+
+					ents.add(ent);
+				}
+			}
+		}
+
+		return ents;
+	}
+
+	/**
+	 * POST REST service for uploading an image file to the database for an
+	 * identity
+	 * 
+	 * @param fileInputStream
+	 *            the form data parameter containing the input stream of the
+	 *            image file
+	 * @param id
+	 *            the identity id for which the image is for
+	 * @return a simple 200 OK status response or a 204 No Content response if
+	 *         no id was sent
+	 * @throws Exception
+	 */
+	@RequiredRight(value = "ColumnDirPluginRestServiceRight")
+	@POST
+	@Path("/uploadIdentityImage")
+	@Consumes({ "multipart/form-data" })
+	@Produces("application/json")
+	public Response uploadIdentityImage(FormDataMultiPart formParams, @FormDataParam("id") String id) throws Exception {
+		FormDataBodyPart fooPar = formParams.getField("file");
+		ResponseBuilder response = null;
+		PreparedStatement pre = null;
+		try {
+			// Assume i am sending only files with the request
+			InputStream fileInputStream = ((BodyPartEntity) fooPar.getEntity()).getInputStream();
+			ResultSet rs = null;
+			Environment environment = Environment.getEnvironment();
+			// Connection con =
+			// environment.getEnvironment().getJDBCConnection();
+			Connection con = environment.getPluginsConfiguration().getDataSource().getConnection();
+			/*
+			 * Map<String, String> connectionMap = new HashMap<String,
+			 * String>(); connectionMap.put("driverClass",
+			 * "com.mysql.jdbc.Driver"); connectionMap.put("password", "admin");
+			 * connectionMap.put("user", "root"); connectionMap.put("url",
+			 * "jdbc:mysql://localhost:3306/iiq71Plugin?useServerPrepStmts=true&tinyInt1isBit=true&useUnicode=true&characterEncoding=utf8"
+			 * ); Connection con = JdbcUtil.getConnection(connectionMap);
+			 */
+			// checking for null
+			if (id == null) {
+				return Response.status(Response.Status.NO_CONTENT).build();
+			}
+
+			try {
+				// simple count query to check to see if a record exists for the
+				// id already
+				pre = con.prepareStatement("SELECT COUNT(*) AS total FROM cd_identity_image WHERE id = ?");
+
+				pre.setString(1, id);
+
+				rs = pre.executeQuery();
+
+				int size = 0;
+
+				if (rs.next()) {
+					size = rs.getInt(1);
+				}
+
+				pre.close();
+
+				// if there is an identity record already, use an update
+				// statement, otherwise use an insert
+				if (size > 0) {
+					pre = con.prepareStatement("UPDATE cd_identity_image SET image_data = ? WHERE id = ?");
+
+					pre.setBinaryStream(1, fileInputStream);
+					pre.setString(2, id);
+
+				} else {
+					pre = con.prepareStatement("INSERT INTO cd_identity_image VALUES(?,?)");
+
+					pre.setString(1, id);
+					pre.setBinaryStream(2, fileInputStream);
+				}
+
+				pre.executeUpdate();
+
+				log.debug("Successfully inserted the identity image into the database");
+
+				response = Response.ok("Image uploaded successfully");
+
+			} catch (SQLException e) {
+				log.debug(e);
+				// e.printStackTrace();
+			} finally {
+				if (rs != null) {
+					rs.close();
+				}
+
+				if (pre != null) {
+					pre.close();
+				}
+
+				if (con != null) {
+					con.close();
+				}
+			}
+
+			if (response == null) {
+				response = Response.status(Response.Status.NO_CONTENT);
+			}
+		} catch (Exception e) {
+			e.printStackTrace();
+			throw e;
+		}
+		return response.build();
+	}
+
+	/**
+	 * REST service call for retrieving base64 encoded string representations of
+	 * the image for the identity
+	 * 
+	 * @param identityId
+	 *            the identity id for which to retrieve an image for
+	 * @return the base64 encoded string for the image or a 204 No Content
+	 *         response
+	 * @throws Exception
+	 */
+	@GET
+	@Path("images")
+	@Produces("image/jpg")
+	public Response getIdentityImage(@QueryParam("id") String identityId) throws Exception {
+		ResponseBuilder response = null;
+		PreparedStatement pre = null;
+		ResultSet rs = null;
+
+		// Connection con =
+		// PluginEnvironment.getEnvironment().getJDBCConnection();
+		// Connection con = environment.getEnvironment().getJDBCConnection();
+		/*
+		 * Map<String, String> connectionMap = new HashMap<String, String>();
+		 * connectionMap.put("driverClass", "com.mysql.jdbc.Driver");
+		 * connectionMap.put("password", "admin"); connectionMap.put("user",
+		 * "root"); connectionMap.put("url",
+		 * "jdbc:mysql://localhost:3306/iiq71Plugin?useServerPrepStmts=true&tinyInt1isBit=true&useUnicode=true&characterEncoding=utf8"
+		 * ); Connection con = JdbcUtil.getConnection(connectionMap);
+		 */
+		Environment environment = Environment.getEnvironment();
+
+		Connection con = environment.getPluginsConfiguration().getDataSource().getConnection();
+		// checking for null
+		if (identityId == null) {
+			return Response.status(Response.Status.NO_CONTENT).build();
+		}
+
+		try {
+			pre = con.prepareStatement("SELECT * FROM cd_identity_image WHERE id = ?");
+			pre.setString(1, identityId);
+
+			rs = pre.executeQuery();
+
+			if (rs.next()) {
+				// retrieves the binary data from the database
+				Blob blob = rs.getBlob("image_data");
+				if (blob != null && blob.length() > 0) {
+					int length = (int) blob.length();
+					byte[] bytes = blob.getBytes(1, length);
+
+					// encodes the binary data to a Base64 string
+					String data = Base64.encodeBase64String(bytes);
+
+					response = Response.ok(data);
+				}
+			}
+
+		} catch (SQLException e) {
+			log.debug(e);
+			// e.printStackTrace();
+		} finally {
+			if (rs != null) {
+				rs.close();
+			}
+
+			if (pre != null) {
+				pre.close();
+			}
+
+			if (con != null) {
+				con.close();
+			}
+		}
+
+		if (response == null) {
+			response = Response.status(Response.Status.NO_CONTENT);
+		}
+
+		return response.build();
+	}
+
+	@Override
+	public String getPluginName() {
+		return "columndirectory";
+	}
+
+	@RequiredRight(value = "ColumnDirPluginRestServiceRight")
+	@GET
+	@Path("/getIdentity/{id}")
+	@Produces(MediaType.APPLICATION_JSON)
+	public String getIdentity(@PathParam("id") String identityId) throws Exception {
+		SailPointContext context = SailPointFactory.getCurrentContext();
+		this.context=context;
+		JSONArray ja = new JSONArray();
+		JSONArray jaChild = new JSONArray();
+
+		JSONObject jo = new JSONObject();
+
+		JSONArray jaGreatGrandChild = new JSONArray();
+		QueryOptions qo = new QueryOptions();
+		Identity id = context.getObjectById(Identity.class, identityId);
+		jo.put("displayname", id.getDisplayableName());
+		jo.put("jobtitle", id.getAttribute("jobTitle"));
+		if (id.getManager() != null) {
+			if (id.getManager().getName() != null) {
+				String manager = id.getManager().getName();
+				String mgr = manager.replace(".", " ");
+				jo.put("manager", mgr);
+			}
+		}
+		if (id.getAttribute("inactive") != null) {
+			if ((boolean) id.getAttribute("inactive")) {
+				jo.put("status", "Inactive");
+				jo.put("color", "red");
+			} else {
+				jo.put("status", "Active");
+				jo.put("color", "green");
+			}
+		}
+		if (id.getEmail() != null) {
+
+			jo.put("email", id.getEmail());
+		}
+		if (id.getAttribute("location") != null) {
+			jo.put("location", id.getAttribute("location"));
+		}
+		if (id.getAttribute("department") != null) {
+			jo.put("department", id.getAttribute("department"));
+		}
+
+		if (id.getId() != null) {
+			String imageData = getImageDataHelper(id.getId());
+			jo.put("Image", imageData.toString());
+		}		
+		List<Identity> childIds = getChildIdentities(id);
+		
+		for (Identity child : childIds) {
+			JSONObject joChild = new JSONObject();
+			JSONArray jaGrandChild = new JSONArray();
+			if (child.getDisplayableName() != null) {
+				joChild.put("displayname", child.getDisplayableName());
+			}
+			if (child.getAttribute("jobTitle") != null) {
+				joChild.put("jobtitle", child.getAttribute("jobTitle"));
+			}
+			if (child.getAttribute("department") != null) {
+				joChild.put("department", child.getAttribute("department"));
+			}
+			if (child.getManager() != null) {
+				if (child.getManager().getName() != null) {
+					String childManager = child.getManager().getName();
+					String childMgr = childManager.replace(".", " ");
+					joChild.put("manager", childMgr);
+				}
+			}
+			if (child.getAttribute("inactive") != null) {
+				if ((boolean) child.getAttribute("inactive")) {
+					joChild.put("status", "Inactive");
+					joChild.put("color", "red");
+				} else {
+					joChild.put("status", "Active");
+					joChild.put("color", "green");
+				}
+			}
+			if (child.getEmail() != null) {
+				joChild.put("email", child.getEmail());
+			}
+			if (child.getAttribute("location") != null) {
+				joChild.put("location", child.getAttribute("location"));
+			}
+			if (child.getId() != null) {
+				String childImageData = getImageDataHelper(child.getId());
+				joChild.put("Image", childImageData.toString());
+			}
+			if (child.getManagerStatus()) {
+				joChild.put("isManager", true);
+				QueryOptions qor = new QueryOptions();
+				qor.addFilter(Filter.like("manager.name", child.getName(), Filter.MatchMode.ANYWHERE));
+				List<Identity> grandids = context.getObjects(Identity.class, qor);
+				for (Identity grandChild : grandids) {
+					JSONObject joGrandChild = new JSONObject();
+					if (grandChild.getDisplayableName() != null) {
+						joGrandChild.put("displayname", grandChild.getDisplayableName());
+					}
+					if (grandChild.getAttribute("jobTitle") != null) {
+						joGrandChild.put("jobtitle", grandChild.getAttribute("jobTitle"));
+					}
+					if (grandChild.getAttribute("department") != null) {
+						joGrandChild.put("department", grandChild.getAttribute("department"));
+					}
+					if (grandChild.getManager() != null) {
+						if (grandChild.getManager().getName() != null) {
+							String grandChildManager = grandChild.getManager().getName();
+
+							String grandChildMgr = grandChildManager.replace(".", " ");
+							joGrandChild.put("manager", grandChildMgr);
+						}
+					}
+					if (grandChild.getAttribute("inactive") != null) {
+						if ((boolean) grandChild.getAttribute("inactive")) {
+							joGrandChild.put("status", "Inactive");
+							joGrandChild.put("color", "red");
+						} else {
+							joGrandChild.put("status", "Active");
+							joGrandChild.put("color", "green");
+						}
+					}
+					if (grandChild.getEmail() != null) {
+						joGrandChild.put("email", grandChild.getEmail());
+					}
+					if (grandChild.getAttribute("location") != null) {
+						joGrandChild.put("location", grandChild.getAttribute("location"));
+					}
+					if (grandChild.getId() != null) {
+						String grandChildImageData = getImageDataHelper(grandChild.getId());
+						joGrandChild.put("Image", grandChildImageData.toString());
+					}
+					jaGrandChild.put(joGrandChild);
+					joChild.put("children", jaGrandChild);
+				}
+			} else {
+				joChild.put("isManager", false);
+			}
+
+			jaChild.put(joChild);
+		}
+		jo.put("children", jaChild);
+		ja.put(jo);
+		JSONObject joc = new JSONObject();
+		joc.put("data", ja);
+
+		return jo.toString();
+	}
+
+	private List<Identity> getChildIdentities(Identity child) throws GeneralException {
+		QueryOptions qor = new QueryOptions();
+		qor.addFilter(Filter.like("manager.name", child.getName(), Filter.MatchMode.ANYWHERE));
+		List<Identity> childIds = this.context.getObjects(Identity.class, qor);
+		return childIds;
+	}
+
+	private String getImageDataHelper(String identityId) {
+		PreparedStatement pre = null;
+		ResultSet rs = null;
+		String data = "";
+		Connection con = null;
+		Environment environment = Environment.getEnvironment();
+
+		try {
+			con = environment.getPluginsConfiguration().getDataSource().getConnection();
+		} catch (SQLException e1) {
+			// TODO Auto-generated catch block
+			e1.printStackTrace();
+		}
+		// checking for null
+		if (identityId == null) {
+			// return Response.status(Response.Status.NO_CONTENT);
+		}
+
+		try {
+			pre = con.prepareStatement("SELECT * FROM cd_identity_image WHERE id = ?");
+			pre.setString(1, identityId);
+
+			rs = pre.executeQuery();
+
+			if (rs.next()) {
+				// retrieves the binary data from the database
+				Blob blob = rs.getBlob("image_data");
+				if (blob != null && blob.length() > 0) {
+					int length = (int) blob.length();
+					byte[] bytes = blob.getBytes(1, length);
+
+					// encodes the binary data to a Base64 string
+					data = Base64.encodeBase64String(bytes);
+					return data;
+				}
+			}
+		} catch (SQLException e) {
+			log.debug(e);
+			// e.printStackTrace();
+		} finally {
+			if (rs != null) {
+				try {
+					rs.close();
+				} catch (SQLException e) {
+					// TODO Auto-generated catch block
+					e.printStackTrace();
+				}
+			}
+
+			if (pre != null) {
+				try {
+					pre.close();
+				} catch (SQLException e) {
+					// TODO Auto-generated catch block
+					e.printStackTrace();
+				}
+			}
+
+			if (con != null) {
+				try {
+					con.close();
+				} catch (SQLException e) {
+					// TODO Auto-generated catch block
+					e.printStackTrace();
+				}
+			}
+		}
+		return data;
+	}
+
+	@GET
+	@Path("/allIdentities/{flag}")
+	@Produces(MediaType.APPLICATION_JSON)
+	public Response getAllIdentitity(@PathParam("flag") String managerFlag) throws Exception {
+		SailPointContext context = SailPointFactory.getCurrentContext();
+		Boolean managerSearch = false;
+		if (managerFlag.equalsIgnoreCase("true"))
+			managerSearch = true;
+		ResponseBuilder response = null;
+		JSONArray ja = new JSONArray();
+		QueryOptions qo = new QueryOptions();
+		// int countRole = limit;
+		int i = 0;
+		// qo.setResultLimit(countRole);
+		log.trace(" qo.setResultLimit " + qo.getResultLimit());
+		qo.setFirstRow(i);
+		Ordering o = new Ordering("displayName", true);
+		o.setAscending(true);
+		List<Ordering> orderings = new ArrayList<Ordering>();
+		orderings.add(o);
+		qo.setOrderings(orderings);
+		if (managerSearch) {
+			qo.addFilter(Filter.eq("managerStatus", true));
+		}
+		log.trace("getAllIdentities qo.getResultLimit: " + qo.getResultLimit());
+		ArrayList<String> colsToRead = new ArrayList<String>();
+		colsToRead.add("displayName");
+		colsToRead.add("email");
+		colsToRead.add("id");
+		colsToRead.add("name");
+
+		Iterator dtName = context.search(Identity.class, qo, colsToRead);
+		try {
+			while (dtName.hasNext()) {
+				Object[] dataTypeRecord = (Object[]) dtName.next();
+				String displayName = (String) dataTypeRecord[0];
+				String id = (String) dataTypeRecord[2];
+				JSONObject jo2 = new JSONObject();
+				jo2.put("displayName", displayName);
+				jo2.put("email", null != dataTypeRecord[1] ? (String) dataTypeRecord[1] : "");
+				jo2.put("id", id);
+				jo2.put("name", null != dataTypeRecord[3] ? (String) dataTypeRecord[3] : "");
+				ja.put(jo2);
+				// context.decache(matchedLink);
+			}
+		} catch (Exception ex) {
+			log.error("Error while reading identities. " + ex.getMessage());
+		} finally {
+			sailpoint.tools.Util.flushIterator(dtName);
+		}
+		/*
+		 * List<Identity> idList = context.getObjects(Identity.class, qo);
+		 * log.trace("ID's" + idList); for (Identity id : idList) { if (idList
+		 * != null) { JSONObject jo1 = ColumnPluginUtil.convertToIdentityDTO(id,
+		 * 1); String str2 = jo1.getString("displayName"); // String str3 =
+		 * jo1.getString("email"); JSONObject jo2 = new JSONObject();
+		 * jo2.put("displayName", str2); jo2.put("email", jo1.has("email") ?
+		 * jo1.getString("email") : ""); ja.put(jo2); }
+		 * 
+		 * }
+		 */
+
+		JSONObject jo = new JSONObject();
+		jo.put("data", ja);
+		response = Response.ok(jo.toString());
+		return response.build();
+	}
+
+	@GET
+	@Path("/moreIdentities/{manager}/{flag}")
+	@Produces(MediaType.APPLICATION_JSON)
+	public Response getMoreIdentities(@PathParam("manager") String manager, @PathParam("flag") String managerFlag)
+			throws Exception {
+		SailPointContext context = SailPointFactory.getCurrentContext();
+		Boolean managerSearch = false;
+		if (managerFlag.equalsIgnoreCase("true"))
+			managerSearch = true;
+		ResponseBuilder response = null;
+		JSONArray ja = new JSONArray();
+		QueryOptions qo = new QueryOptions();
+		// int countRole = limit;
+		String filter = manager;
+		log.trace("filter: " + filter);
+		int i = 0;
+		// qo.setResultLimit(countRole);
+		log.trace(" qo.setResultLimit " + qo.getResultLimit());
+		qo.setFirstRow(i);
+		Ordering o = new Ordering("displayName", true);
+		o.setAscending(true);
+		List<Ordering> orderings = new ArrayList<Ordering>();
+		orderings.add(o);
+		qo.setOrderings(orderings);
+		Filter filterSearch = null;
+		String[] wordSearch = filter.split("\\s+");
+		if (managerSearch) {
+			if (wordSearch.length > 0) {
+				filterSearch = Filter.and(Filter.like("displayName", filter, Filter.MatchMode.ANYWHERE),
+						Filter.eq("managerStatus", true));
+				qo.addFilter(filterSearch);
+			} else {
+				qo.addFilter(Filter.eq("managerStatus", true));
+			}
+		} else {
+			filterSearch = Filter.like("displayName", filter, Filter.MatchMode.ANYWHERE);
+			qo.addFilter(filterSearch);
+		}
+		log.trace("qo.getResultLimit: " + qo.getResultLimit());
+		ArrayList<String> colsToRead = new ArrayList<String>();
+		colsToRead.add("displayName");
+		colsToRead.add("email");
+		colsToRead.add("id");
+		colsToRead.add("name");
+
+		Iterator dtName = context.search(Identity.class, qo, colsToRead);
+		try {
+			while (dtName.hasNext()) {
+				Object[] dataTypeRecord = (Object[]) dtName.next();
+				String displayName = (String) dataTypeRecord[0];
+				String id = (String) dataTypeRecord[2];
+				JSONObject jo2 = new JSONObject();
+				jo2.put("displayName", displayName);
+				jo2.put("email", null != dataTypeRecord[1] ? (String) dataTypeRecord[1] : "");
+				jo2.put("id", id);
+				jo2.put("name", null != dataTypeRecord[3] ? (String) dataTypeRecord[3] : "");
+				ja.put(jo2);
+				// context.decache(matchedLink);
+			}
+		} catch (Exception ex) {
+			log.error("Error while reading identities. " + ex.getMessage());
+		} finally {
+			sailpoint.tools.Util.flushIterator(dtName);
+		}
+		/*
+		 * List<Identity> idList = context.getObjects(Identity.class, qo);
+		 * log.trace("ID's" + idList); for (Identity id : idList) { if (idList
+		 * != null) { // log.trace("ID's" + id); JSONObject jo1 =
+		 * ColumnPluginUtil.convertToIdentityDTO(id, 1); String str2 =
+		 * jo1.getString("displayName"); // String str3 =
+		 * jo1.getString(jo1.has("email") ? "email"); JSONObject jo2 = new
+		 * JSONObject(); jo2.put("displayName", str2); jo2.put("email",
+		 * jo1.has("email") ? jo1.getString("email") : ""); ja.put(jo2); }
+		 * 
+		 * }
+		 */
+		JSONObject jo = new JSONObject();
+		jo.put("data", ja);
+		response = Response.ok(jo.toString());
+		log.debug("response****: " + response);
+
+		return response.build();
+
+	}
+
+}
